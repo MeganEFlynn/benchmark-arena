@@ -1005,9 +1005,12 @@
                 const baselineUrl = document.getElementById('baseline-url').value;
                 const quantizedUrl = document.getElementById('quantized-url').value;
 
-                const metricsBefore = await fetchVllmMetrics(quantizedUrl);
+                // Warm up both servers so neither has a connection/event-loop advantage
+                const [metricsBefore] = await Promise.all([
+                    fetchVllmMetrics(quantizedUrl),
+                    fetchVllmMetrics(baselineUrl)
+                ]);
 
-                // Set startTime after metrics fetch so TTFT isn't inflated
                 const modelStartTime = Date.now();
                 baselineStats.startTime = modelStartTime;
                 quantizedStats.startTime = modelStartTime;
@@ -1180,16 +1183,12 @@
                                 const data = JSON.parse(line.substring(6));
                                 if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
                                     const token = data.choices[0].delta.content;
-                                    markdownBuffer += token;
 
-                                    // Count actual tokens in this chunk (important for speculative decoding!)
-                                    const tokensInChunk = getTokenCount(token);
-
-                                    // Scroll chat window to show latest content
-                                    const chatElement = document.getElementById(`${modelType}-chat`);
-                                    chatElement.scrollTop = chatElement.scrollHeight;
-
+                                    // Capture timestamp BEFORE any processing to avoid chart-update skew
                                     const now = Date.now();
+
+                                    markdownBuffer += token;
+                                    const tokensInChunk = getTokenCount(token);
 
                                     // Record first token time (TTFT)
                                     if (firstToken) {
@@ -1211,26 +1210,25 @@
                                     stats.tokens += tokensInChunk;
                                     stats.tokenTimestamps.push({ tokens: stats.tokens, time: now });
 
-                                    // Add tokens to visualization
                                     const vizTokenCount = modelType === 'baseline' ? 1 : tokensInChunk;
                                     addTokensToViz(modelType, vizTokenCount);
 
-                                    // Calculate throughput in real-time
                                     const duration = (now - stats.startTime) / 1000;
                                     stats.throughput = stats.tokens / duration;
                                     document.getElementById(`${modelType}-throughput`).textContent = stats.throughput.toFixed(2) + ' t/s';
 
-                                    // Update charts in real-time
-                                    updateCharts();
-
-                                    // Update summary stats in real-time
-                                    updateSummaryStats();
+                                    // Scroll chat window
+                                    const chatElement = document.getElementById(`${modelType}-chat`);
+                                    chatElement.scrollTop = chatElement.scrollHeight;
                                 }
                             } catch (e) {
                                 console.error('Error parsing stream data:', e);
                             }
                         }
                     }
+
+                    updateCharts();
+                    updateSummaryStats();
                 }
             } else {
                 // Non-streaming response
