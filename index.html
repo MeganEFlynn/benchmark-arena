@@ -624,12 +624,11 @@
             size: null,
             connected: false,
             ttft: null,
-            itlValues: [],
             itlMean: null,
-            itlStdDev: null,
             throughput: null,
             tokens: 0,
             startTime: null,
+            firstTokenTime: null,
             lastTokenTime: null,
             tokenTimestamps: []
         };
@@ -639,9 +638,7 @@
             size: null,
             connected: false,
             ttft: null,
-            itlValues: [],
             itlMean: null,
-            itlStdDev: null,
             throughput: null,
             tokens: 0,
             startTime: null,
@@ -997,14 +994,14 @@
             quantizedStats.tokens = 0;
             baselineStats.ttft = null;
             quantizedStats.ttft = null;
-            baselineStats.itlValues = [];
             baselineStats.itlMean = null;
             baselineStats.throughput = null;
+            baselineStats.firstTokenTime = null;
             baselineStats.lastTokenTime = null;
             baselineStats.tokenTimestamps = [];
-            quantizedStats.itlValues = [];
             quantizedStats.itlMean = null;
             quantizedStats.throughput = null;
+            quantizedStats.firstTokenTime = null;
             quantizedStats.lastTokenTime = null;
             quantizedStats.tokenTimestamps = [];
             quantizedStats.draftTokensProposed = 0;
@@ -1035,7 +1032,7 @@
                     fetchVllmMetrics(baselineUrl)
                 ]);
 
-                const modelStartTime = Date.now();
+                const modelStartTime = performance.timeOrigin + performance.now();
                 baselineStats.startTime = modelStartTime;
                 quantizedStats.startTime = modelStartTime;
 
@@ -1088,12 +1085,9 @@
                 messages: messages,
                 temperature: temperature,
                 max_tokens: maxTokens,
-                stream: stream
+                stream: stream,
+                logprobs: true
             };
-
-            // Note: By default, vLLM does not enable extended thinking/reasoning modes.
-            // If you need to explicitly disable it for certain models, you can add:
-            // reasoning_effort: "none" or other model-specific parameters here.
 
             if (stream) {
                 // Create two divs - one for parsed markdown and one for streaming text
@@ -1195,12 +1189,17 @@
                         break;
                     }
 
+                    // Timestamp once per read() call — all SSE lines in this
+                    // TCP read share the same arrival time.
+                    const now = performance.timeOrigin + performance.now();
+
                     buffer += decoder.decode(value, { stream: true });
 
                     // Process each complete line
                     const lines = buffer.split('\n');
                     buffer = lines.pop(); // Keep incomplete line in buffer
 
+                    let readTokens = 0;
                     for (const line of lines) {
                         if (line.startsWith('data: ') && !line.includes('[DONE]')) {
                             try {
@@ -1208,49 +1207,46 @@
                                 if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
                                     const token = data.choices[0].delta.content;
 
-                                    // Capture timestamp BEFORE any processing to avoid chart-update skew
-                                    const now = Date.now();
-
                                     markdownBuffer += token;
-                                    const tokensInChunk = getTokenCount(token);
+                                    const logprobsContent = data.choices[0].logprobs && data.choices[0].logprobs.content;
+                                    const tokensInChunk = logprobsContent ? logprobsContent.length : getTokenCount(token);
 
-                                    // Record first token time (TTFT)
-                                    if (firstToken) {
-                                        stats.ttft = now - stats.startTime;
-                                        document.getElementById(`${modelType}-ttft`).textContent = stats.ttft + ' ms';
-                                        firstToken = false;
-                                    } else {
-                                        // Record inter-token latency (ITL)
-                                        const currentItl = now - (stats.lastTokenTime || stats.startTime);
-                                        const perTokenItl = tokensInChunk > 0 ? currentItl / tokensInChunk : currentItl;
-                                        stats.itlValues.push(perTokenItl);
-                                        const { mean, stdDev } = calculateStats(stats.itlValues);
-                                        stats.itlMean = mean;
-                                        stats.itlStdDev = stdDev;
-                                        document.getElementById(`${modelType}-itl`).textContent = `${mean.toFixed(1)} ±${stdDev.toFixed(1)} ms`;
-                                    }
-
-                                    stats.lastTokenTime = now;
-                                    stats.tokens += tokensInChunk;
-                                    stats.tokenTimestamps.push({ tokens: stats.tokens, time: now });
-
-                                    const vizTokenCount = modelType === 'baseline' ? 1 : tokensInChunk;
-                                    addTokensToViz(modelType, vizTokenCount);
-
-                                    const duration = (now - stats.startTime) / 1000;
-                                    stats.throughput = stats.tokens / duration;
-                                    document.getElementById(`${modelType}-throughput`).textContent = stats.throughput.toFixed(2) + ' t/s';
-                                    document.getElementById(`${modelType}-tokens`).textContent = stats.tokens;
-                                    document.getElementById(`${modelType}-latency`).textContent = duration.toFixed(2) + ' s';
-
-                                    // Scroll chat window
-                                    const chatElement = document.getElementById(`${modelType}-chat`);
-                                    chatElement.scrollTop = chatElement.scrollHeight;
+                                    readTokens += tokensInChunk;
+                                    addTokensToViz(modelType, tokensInChunk);
                                 }
                             } catch (e) {
                                 console.error('Error parsing stream data:', e);
                             }
                         }
+                    }
+
+                    if (readTokens > 0) {
+                        if (firstToken) {
+                            stats.ttft = now - stats.startTime;
+                            stats.firstTokenTime = now;
+                            document.getElementById(`${modelType}-ttft`).textContent = stats.ttft.toFixed(0) + ' ms';
+                            firstToken = false;
+                        }
+
+                        stats.lastTokenTime = now;
+                        stats.tokens += readTokens;
+
+                        // ITL = total generation time / total tokens (weighted correctly)
+                        if (stats.tokens > 0 && stats.firstTokenTime) {
+                            const genTime = now - stats.firstTokenTime;
+                            stats.itlMean = genTime / stats.tokens;
+                            document.getElementById(`${modelType}-itl`).textContent = `${stats.itlMean.toFixed(1)} ms`;
+                        }
+                        stats.tokenTimestamps.push({ tokens: stats.tokens, time: now });
+
+                        const duration = (now - stats.startTime) / 1000;
+                        stats.throughput = stats.tokens / duration;
+                        document.getElementById(`${modelType}-throughput`).textContent = stats.throughput.toFixed(2) + ' t/s';
+                        document.getElementById(`${modelType}-tokens`).textContent = stats.tokens;
+                        document.getElementById(`${modelType}-latency`).textContent = duration.toFixed(2) + ' s';
+
+                        const chatElement = document.getElementById(`${modelType}-chat`);
+                        chatElement.scrollTop = chatElement.scrollHeight;
                     }
 
                     updateCharts();
@@ -1375,13 +1371,12 @@
             }
 
             // ITL Speedup
-            if (baselineStats.itlValues.length > 0 && quantizedStats.itlValues.length > 0 && baselineStats.itlMean && quantizedStats.itlMean) {
+            if (baselineStats.itlMean && quantizedStats.itlMean) {
                 const itlMultiplier = (baselineStats.itlMean / quantizedStats.itlMean).toFixed(1);
                 if (document.getElementById('itl-improvement')) {
                     document.getElementById('itl-improvement').textContent = `${itlMultiplier}x`;
                 }
-            } else if (baselineStats.itlValues.length > 0 || quantizedStats.itlValues.length > 0) {
-                // Show partial data if only one model is generating
+            } else if (baselineStats.tokens > 0 || quantizedStats.tokens > 0) {
                 if (document.getElementById('itl-improvement')) {
                     document.getElementById('itl-improvement').textContent = '...';
                 }
@@ -1406,12 +1401,11 @@
                 size: null,
                 connected: false,
                 ttft: null,
-                itlValues: [],
                 itlMean: null,
-                itlStdDev: null,
                 throughput: null,
                 tokens: 0,
                 startTime: null,
+                firstTokenTime: null,
                 lastTokenTime: null,
                 tokenTimestamps: []
             };
@@ -1421,12 +1415,11 @@
                 size: null,
                 connected: false,
                 ttft: null,
-                itlValues: [],
                 itlMean: null,
-                itlStdDev: null,
                 throughput: null,
                 tokens: 0,
                 startTime: null,
+                firstTokenTime: null,
                 lastTokenTime: null,
                 tokenTimestamps: [],
                 acceptanceRate: null,
